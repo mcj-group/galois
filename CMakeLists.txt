@@ -215,18 +215,18 @@ if (GALOIS_ENABLE_GPU)
 
   add_subdirectory(libgpu)
 endif()
-add_subdirectory(libpangolin)
+#add_subdirectory(libpangolin)
 
 # Applications (apps)
 add_subdirectory(lonestar)
 
-add_subdirectory(scripts)
-add_subdirectory(inputs)
-add_subdirectory(tools)
+#add_subdirectory(scripts)
+#add_subdirectory(inputs)
+#add_subdirectory(tools)
 
-if(USE_EXP)
-  add_subdirectory(lonestar/experimental)
-endif(USE_EXP)
+#if(USE_EXP)
+#  add_subdirectory(lonestar/experimental)
+#endif(USE_EXP)
 
 ###### Documentation ######
 
