@@ -151,7 +151,7 @@ void deltaPageRank(Graph& graph) {
       [&](const GNode& src) {
         constexpr const galois::MethodFlag flag = galois::MethodFlag::UNPROTECTED;
         LNode& sdata = graph.getData(src, flag);
-        float res = sdata.residual.load(std::memory_order_relaxed);
+        float res = sdata.residual.load(std::memory_order_seq_cst);
         int src_nout = std::distance(graph.edge_begin(src, flag),
                                       graph.edge_end(src, flag));
         if (src_nout == 0) src_nout = 1;
@@ -170,14 +170,14 @@ void deltaPageRank(Graph& graph) {
         LNode& sdata = graph.getData(src);
         constexpr const galois::MethodFlag flag = galois::MethodFlag::UNPROTECTED;
 
-        float curRes = sdata.residual.load(std::memory_order_relaxed);
+        float curRes = sdata.residual.load(std::memory_order_seq_cst);
         if (curRes <= tolerance || curRes < pushedPrio) {
           WLEmptyWork += 1;
           return;
         }
 
         // Clear residual and add to src's pagerank value
-        PRTy oldResidual = sdata.residual.exchange(0.0, std::memory_order_acq_rel);
+        PRTy oldResidual = sdata.residual.exchange(0.0, std::memory_order_seq_cst);
         sdata.value += oldResidual;
         int src_nout = std::distance(graph.edge_begin(src, flag),
                                       graph.edge_end(src, flag));
@@ -263,14 +263,14 @@ void MQBucketThreadTask(Graph& graph, MQ_Bucket &wl, stat *stats) {
     float pushedPrio = (float)b * INV_MULT_VAL;
 
     LNode& sdata = graph.getData(src);
-    float curRes = sdata.residual.load(std::memory_order_relaxed);
+    float curRes = sdata.residual.load(std::memory_order_seq_cst);
     if (curRes <= tolerance || curRes < pushedPrio) {
       emptyWork++;
       continue;
     }
 
     // Clear residual and add to src's pagerank value
-    PRTy oldResidual = sdata.residual.exchange(0.0, std::memory_order_acq_rel);
+    PRTy oldResidual = sdata.residual.exchange(0.0, std::memory_order_seq_cst);
     sdata.value += oldResidual;
     int src_nout = std::distance(graph.edge_begin(src, flag),
                                   graph.edge_end(src, flag));
@@ -347,7 +347,7 @@ void MQBucketPageRank(Graph& graph) {
     LNode& sdata = graph.getData(v, flag);
     int nout = std::distance(graph.edge_begin(v, flag),
                               graph.edge_end(v, flag));
-    float res = sdata.residual.load(std::memory_order_acquire);
+    float res = sdata.residual.load(std::memory_order_seq_cst);
     if (nout == 0) nout = 1;
     return mbq::BucketID(res / nout * MULT_VAL) >> stepShift;
   };
@@ -373,7 +373,7 @@ void MQBucketPageRank(Graph& graph) {
     LNode& sdata = graph.getData(i, flag);
     int nout = std::distance(graph.edge_begin(i, flag),
                               graph.edge_end(i, flag));
-    float res = sdata.residual.load(std::memory_order_relaxed);
+    float res = sdata.residual.load(std::memory_order_seq_cst);
     if (nout == 0) nout = 1;
     uint32_t prio = res / nout * MULT_VAL;
     wl.push(prio, i);
@@ -446,14 +446,14 @@ void MQThreadTask(Graph& graph, MQ_Type &wl, stat *stats) {
     ++iter;
 
     LNode& sdata = graph.getData(src);
-    float curRes = sdata.residual.load(std::memory_order_relaxed);
+    float curRes = sdata.residual.load(std::memory_order_seq_cst);
     if (curRes <= tolerance || curRes < pushedPrio) {
       emptyWork++;
       continue;
     }
 
     // Clear residual and add to src's pagerank value
-    PRTy oldResidual = sdata.residual.exchange(0.0, std::memory_order_acq_rel);
+    PRTy oldResidual = sdata.residual.exchange(0.0, std::memory_order_seq_cst);
     sdata.value += oldResidual;
     int src_nout = std::distance(graph.edge_begin(src, flag),
                                   graph.edge_end(src, flag));
@@ -540,7 +540,7 @@ void MQPageRank(Graph& graph) {
   // Insert all the vertices with their initial residual
   for (uint i = 0; i < graph.size(); i++) {
     LNode& sdata = graph.getData(i, flag);
-    float res = sdata.residual.load(std::memory_order_relaxed);
+    float res = sdata.residual.load(std::memory_order_seq_cst);
     int nout = std::distance(graph.edge_begin(i, flag),
                               graph.edge_end(i, flag));
     if (nout == 0) nout = 1;
@@ -639,7 +639,7 @@ int main(int argc, char** argv) {
         }
 
         res = ALPHA * INIT_RESIDUAL * res;
-        sdata.residual.store(res, std::memory_order_relaxed);
+        sdata.residual.store(res, std::memory_order_seq_cst);
       },
       galois::no_stats(), galois::loopname("Initialize residuals"));
   // }

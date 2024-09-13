@@ -207,7 +207,7 @@ struct stat {
 };
 
 uint32_t __attribute__ ((noinline)) getPrioData(std::atomic<uint32_t> *p) {
-  return p->load(std::memory_order_acquire);
+  return p->load(std::memory_order_seq_cst);
 }
 
 #ifdef PERF
@@ -222,8 +222,8 @@ inline bool changeMin(
       if (d <= newDist) break;
       swapped = prios[dst].compare_exchange_weak(
           d, newDist,
-          std::memory_order_acq_rel,
-          std::memory_order_acquire);
+          std::memory_order_seq_cst,
+          std::memory_order_seq_cst);
     } while(!swapped);
     return swapped;
 }
@@ -244,7 +244,7 @@ void MQThreadTask(Graph& graph, MQ &wl, stat *stats, std::atomic<uint32_t> *prio
 #ifdef PERF
     uint32_t srcD = getPrioData(&prios[src]);
 #else
-    uint32_t srcD = prios[src].load(std::memory_order_acquire);
+    uint32_t srcD = prios[src].load(std::memory_order_seq_cst);
 #endif
     ++iter;
     if (srcD < dist) {
@@ -262,7 +262,7 @@ void MQThreadTask(Graph& graph, MQ &wl, stat *stats, std::atomic<uint32_t> *prio
 #ifdef PERF
       uint32_t oldDist = getPrioData(&prios[dst]);
 #else
-      uint32_t oldDist = prios[dst].load(std::memory_order_relaxed);
+      uint32_t oldDist = prios[dst].load(std::memory_order_seq_cst);
 #endif
       // Attempt to CAS the neighbor to a lower distance
       if (changeMin(prios, dst, oldDist, newDist)) {
@@ -318,7 +318,7 @@ void spawnTasks(MQ_Type& wl, Graph& graph, const GNode& source, int threadNum, s
   }
 
   for (uint64_t i = 0; i < graph.size(); i++) {
-    uint64_t s = prios[i].load(std::memory_order_relaxed);
+    uint64_t s = prios[i].load(std::memory_order_seq_cst);
     if (s == UINT32_MAX) continue;;
     auto& ddata = graph.getData(i);
     ddata = s;
@@ -347,7 +347,7 @@ void MQAlgo(Graph& graph, const GNode& source, int threadNum, int queueNum) {
   // The distance array that records the latest distances
   std::atomic<uint32_t> *prios = new std::atomic<uint32_t>[graph.size()];
   for (uint i = 0; i < graph.size(); i++) {
-    prios[i].store(UINT32_MAX, std::memory_order_relaxed);
+    prios[i].store(UINT32_MAX, std::memory_order_seq_cst);
   }
   prios[source] = 0;
   graph.getData(source) = 0;
@@ -375,7 +375,7 @@ void MQAlgo(Graph& graph, const GNode& source, int threadNum, int queueNum) {
 
     // Lambda for mapping a priority to a priority level
     auto getBucketID = [&] (uint32_t v) -> mbq::BucketID {
-      uint32_t d = prios[v].load(std::memory_order_acquire);
+      uint32_t d = prios[v].load(std::memory_order_seq_cst);
       return (d >> stepShift);
     };
     using MQ_Bucket_Type = mbq::MultiBucketQueue<decltype(getBucketID), decltype(prefetcher), std::greater<mbq::BucketID>, uint32_t, uint32_t, usePrefetch>;
