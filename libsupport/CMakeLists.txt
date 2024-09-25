@@ -15,10 +15,12 @@ target_include_directories(galois_support PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-find_package(fmt REQUIRED)
-if (fmt_VERSION VERSION_LESS 4)
-  message(FATAL_ERROR "fmt must be version 4 or higher. Found ${fmt_VERSION}.")
-endif()
+include(FetchContent)
+FetchContent_Declare(fmt
+  GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+  GIT_TAG master
+)
+FetchContent_MakeAvailable(fmt)
 target_link_libraries(galois_support fmt::fmt)
 
 add_subdirectory(test)

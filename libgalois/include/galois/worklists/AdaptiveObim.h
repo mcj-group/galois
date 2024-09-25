@@ -168,7 +168,7 @@ struct AdaptiveOrderedByIntegerMetric
 
   template <bool _use_descending>
   struct with_descending {
-    AdaptiveOrderedByIntegerMetric<
+    typedef AdaptiveOrderedByIntegerMetric<
         Indexer, Container, BlockPeriod, BSP, uniformBSP, chunk_size, T, Index,
         EnableUmerge, UseMonotonic, _use_descending, Concurrent>
         type;
@@ -358,8 +358,8 @@ private:
       Index maxOfMax                       = p.maxPrio;
       p.cleanup();
       for (unsigned i = 1; i < runtime::activeThreads; ++i) {
-        while (!data.getRemote(i)->lock.try_lock())
-          ;
+        // while (!data.getRemote(i)->lock.try_lock())
+        //   ;
 
         Index& otherMinPrio = data.getRemote(i)->minPrio;
         minOfMin            = std::min(minOfMin, otherMinPrio, compare);
@@ -370,7 +370,7 @@ private:
         allPmodDeqCounts += data.getRemote(i)->stats.pmodAllDeq;
 
         data.getRemote(i)->cleanup();
-        data.getRemote(i)->lock.unlock();
+        // data.getRemote(i)->lock.unlock();
       }
 
       if ((double)numPushesThisStep) {

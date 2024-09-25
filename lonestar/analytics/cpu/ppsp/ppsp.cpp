@@ -19,34 +19,31 @@
 
 #include "galois/Galois.h"
 #include "galois/AtomicHelpers.h"
-#include "galois/gstl.h"
 #include "galois/Reduction.h"
+#include "galois/PriorityQueue.h"
 #include "galois/Timer.h"
 #include "galois/graphs/LCGraph.h"
 #include "galois/graphs/TypeTraits.h"
 #include "Lonestar/BoilerPlate.h"
 #include "Lonestar/BFS_SSSP.h"
+#include "Lonestar/Utils.h"
+
+#include <include/MultiBucketQueue.h>
+#include <include/MultiQueue.h>
 
 #include "llvm/Support/CommandLine.h"
 
 #include <iostream>
-#include <deque>
-#include <type_traits>
-
-#include <include/MultiBucketQueue.h>
-#include <include/MultiQueue.h>
 
 // #define PERF 1
 
 namespace cll = llvm::cl;
 
-static const char* name = "Breadth-first Search";
-
+static const char* name = "Single Source Shortest Path";
 static const char* desc =
     "Computes the shortest path from a source node to all nodes in a directed "
-    "graph using a modified Bellman-Ford algorithm";
-
-static const char* url = "breadth_first_search";
+    "graph using a modified chaotic iteration algorithm";
+static const char* url = "single_source_shortest_path";
 
 static cll::opt<std::string>
     inputFile(cll::Positional, cll::desc("<input file>"), cll::Required);
@@ -55,13 +52,17 @@ static cll::opt<unsigned int>
               cll::desc("Node to start search from (default value 0)"),
               cll::init(0));
 static cll::opt<unsigned int>
+    destNode("destNode",
+              cll::desc("Node to end search from (default value 0)"),
+              cll::init(0));
+static cll::opt<unsigned int>
     reportNode("reportNode",
-               cll::desc("Node to report distance to (default value 1)"),
+               cll::desc("Node to report distance to(default value 1)"),
                cll::init(1));
 static cll::opt<unsigned int>
-    chunk("chunk",
-              cll::desc("chunk size for tuning"),
-              cll::init(64));
+    stepShift("delta",
+              cll::desc("Shift value for the deltastep (default value 13)"),
+              cll::init(13));
 static cll::opt<unsigned int>
     threadNum("threads",
               cll::desc("number of threads for MQ"),
@@ -72,112 +73,147 @@ static cll::opt<unsigned int>
               cll::init(4));
 static cll::opt<unsigned int>
     bucketNum("buckets",
-              cll::desc("number of buckets in a bucket queue"),
+              cll::desc("number of buckets"),
               cll::init(64));
 static cll::opt<unsigned int>
     batch1("batch1",
-              cll::desc("batch size for popping"),
+              cll::desc("bucketing batch size"),
               cll::init(1));
 static cll::opt<unsigned int>
     batch2("batch2",
-              cll::desc("batch size for pushing"),
+              cll::desc("bucketing batch size"),
               cll::init(1));
 static cll::opt<unsigned int>
-    prefetch("prefetch",
-              cll::desc("prefetching"),
-              cll::init(0));
+    chunk("chunk",
+              cll::desc("chunk size for tuning"),
+              cll::init(64));
 static cll::opt<unsigned int>
     stickiness("stick",
               cll::desc("stickiness"),
               cll::init(1));
 static cll::opt<unsigned int>
-    stepShift("delta",
-        cll::desc("Shift value for the deltastep"),
-        cll::init(0));
+    prefetch("prefetch",
+              cll::desc("prefetching"),
+              cll::init(0));
 
-enum Exec { SERIAL, PARALLEL };
+enum Algo {
+  deltaStepOBIM,
+  deltaStepPMOD,
+  MQ,
+  MQBucket,
+};
 
-enum Algo { OBIM, PMOD, MQ, MQBucket };
-
-const char* const ALGO_NAMES[] = {"OBIM", "PMOD", "MQ", "MQBucket"};
-
-static cll::opt<Exec> execution(
-    "exec",
-    cll::desc("Choose SERIAL or PARALLEL execution (default value PARALLEL):"),
-    cll::values(clEnumVal(SERIAL, "SERIAL"), clEnumVal(PARALLEL, "PARALLEL")),
-    cll::init(PARALLEL));
+const char* const ALGO_NAMES[] = {
+    "deltaStepOBIM","deltaStepPMOD", "MQ","MQBucket"};
 
 static cll::opt<Algo> algo(
-    "algo", cll::desc("Choose an algorithm (default value OBIM):"),
-    cll::values(clEnumVal(OBIM, "OBIM"), clEnumVal(PMOD, "PMOD"),
-                clEnumVal(MQ, "MQ"), clEnumVal(MQBucket, "MQBucket")),
-    cll::init(OBIM));
+    "algo", cll::desc("Choose an algorithm (default value auto):"),
+    cll::values(clEnumVal(deltaStepOBIM, "deltaStepOBIM"),
+                clEnumVal(deltaStepPMOD, "deltaStepPMOD"),
+                clEnumVal(MQ, "MQ"),
+                clEnumVal(MQBucket, "MQBucket")));
 
-using Graph =
-    galois::graphs::LC_CSR_Graph<std::atomic<uint32_t>, void>::with_no_lockable<true>::type;
-//::with_numa_alloc<true>::type;
+//! [withnumaalloc]
+using Graph = galois::graphs::LC_CSR_Graph<std::atomic<uint32_t>, uint32_t>::
+    with_no_lockable<true>::type ::with_numa_alloc<true>::type;
+//! [withnumaalloc]
+typedef Graph::GraphNode GNode;
 
-using GNode = Graph::GraphNode;
+constexpr static const bool TRACK_WORK          = true;
+constexpr static const unsigned CHUNK_SIZE      = 64U;
+constexpr static const ptrdiff_t EDGE_TILE_SIZE = 512;
 
-constexpr static const bool TRACK_WORK          = false;
-constexpr static const unsigned CHUNK_SIZE      = 256U;
-constexpr static const ptrdiff_t EDGE_TILE_SIZE = 256;
+using SSSP                 = BFS_SSSP<Graph, uint32_t, true, EDGE_TILE_SIZE>;
+using Dist                 = SSSP::Dist;
+using UpdateRequest        = SSSP::UpdateRequest;
+using UpdateRequestIndexer = SSSP::UpdateRequestIndexer;
+using ReqPushWrap          = SSSP::ReqPushWrap;
+using OutEdgeRangeFn       = SSSP::OutEdgeRangeFn;
 
+template <typename T, typename OBIMTy, typename P, typename R>
+uint32_t deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
+                   const R& edgeRange) {
 
-using BFS = BFS_SSSP<Graph, uint32_t, false, EDGE_TILE_SIZE>;
-
-using UpdateRequest       = BFS::UpdateRequest;
-using UpdateRequestIndexer= BFS::UpdateRequestIndexer;
-using Dist                = BFS::Dist;
-using SrcEdgeTile         = BFS::SrcEdgeTile;
-using SrcEdgeTileMaker    = BFS::SrcEdgeTileMaker;
-using SrcEdgeTilePushWrap = BFS::SrcEdgeTilePushWrap;
-using ReqPushWrap         = BFS::ReqPushWrap;
-using OutEdgeRangeFn      = BFS::OutEdgeRangeFn;
-using TileRangeFn         = BFS::TileRangeFn;
-
-template <bool CONCURRENT, typename T, typename OBIMTy, typename P, typename R>
-void OBIMAlgo(Graph& graph, GNode source, const P& pushWrap,
-               const R& edgeRange) {
-
+  //! [reducible for self-defined stats]
+  galois::GAccumulator<size_t> BadWork;
+  //! [reducible for self-defined stats]
   galois::GAccumulator<size_t> WLEmptyWork;
 
   graph.getData(source) = 0;
+
+	// queue?
   galois::InsertBag<T> initBag;
+
+	// push the source node into the queue
   pushWrap(initBag, source, 0, "parallel");
+
+	// for_each calls for_each_gen()
+	// which takes in a rangemaker, operator function and other arguments
+	// for_each_gen() calls for_each_impl()
+	// initializes the ForEachExecutor,taking in the 
+	// worklist based on the rangemaker, then 
+	// calls threadpool to run
+	// initThread() called in threadpool::run()
+	// get_trait_value<wl_tag>
 
   auto begin = std::chrono::high_resolution_clock::now();
 
   galois::for_each(
-      galois::iterate(initBag),
+      galois::iterate(initBag), // range maker
+			// function to run
       [&](const T& item, auto& ctx) {
         constexpr galois::MethodFlag flag = galois::MethodFlag::UNPROTECTED;
         const auto& sdata                 = graph.getData(item.src, flag);
 
         if (sdata < item.dist) {
-          WLEmptyWork += 1;
+          if (TRACK_WORK)
+            WLEmptyWork += 1;
           return;
         }
-        const Dist newDist = sdata + 1;
 
+        auto& destDist = graph.getData(destNode, flag);
         for (auto ii : edgeRange(item)) {
-          GNode dst     = graph.getEdgeDst(ii);
-          auto& ddist   = graph.getData(dst, flag);
-          Dist oldDist  = galois::atomicMin<uint32_t>(ddist, newDist);
+
+          GNode dst          = graph.getEdgeDst(ii);
+          auto& ddist        = graph.getData(dst, flag);
+          Dist ew            = graph.getEdgeData(ii, flag);
+          const Dist newDist = sdata + ew;
+          if (destDist != SSSP::DIST_INFINITY && newDist > destDist)
+            continue;
+          Dist oldDist       = galois::atomicMin<uint32_t>(ddist, newDist);
           if (newDist < oldDist) {
+            if (TRACK_WORK) {
+              //! [per-thread contribution of self-defined stats]
+              if (oldDist != SSSP::DIST_INFINITY) {
+                BadWork += 1;
+              }
+              //! [per-thread contribution of self-defined stats]
+            }
             pushWrap(ctx, dst, newDist);
           }
         }
       },
-      galois::wl<OBIMTy>(UpdateRequestIndexer{stepShift}), galois::loopname("runBFS"),
-      galois::disable_conflict_detection());
+
+			// arguments
+      galois::wl<OBIMTy>(UpdateRequestIndexer{stepShift}), // OBIM worklist
+
+			// other settings
+      galois::disable_conflict_detection(), galois::loopname("SSSP"));
 
   auto end = std::chrono::high_resolution_clock::now();
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
   std::cout << "runtime_ms " << ms << "\n";
 
-  galois::runtime::reportStat_Single("runBFS", "EmptyWork",
-                                      WLEmptyWork.reduce());
+  if (TRACK_WORK) {
+    //! [report self-defined stats]
+    galois::runtime::reportStat_Single("SSSP", "BadWork", BadWork.reduce());
+    //! [report self-defined stats]
+    galois::runtime::reportStat_Single("SSSP", "WLEmptyWork",
+                                       WLEmptyWork.reduce());
+  }
+
+  auto& destDist = graph.getData(destNode, galois::MethodFlag::UNPROTECTED);
+  return destDist;
 }
 
 using PQElement = std::tuple<uint32_t, uint32_t>;
@@ -234,18 +270,29 @@ void MQThreadTask(Graph& graph, MQ &wl, stat *stats, std::atomic<uint32_t> *prio
       continue;
     }
 
+#ifdef PERF
+    uint32_t destDist = getPrioData(&prios[destNode]);
+#else
+    uint32_t destDist = prios[destNode].load(std::memory_order_acquire);
+#endif
+
     // Iterate neighbors and see if their distances can be lowered
-    uint32_t newDist = dist + 1;
     auto edgeRange = graph.edges(src, galois::MethodFlag::UNPROTECTED);
     for (auto e : edgeRange) {
       GNode dst   = graph.getEdgeDst(e);
+      const auto newDist = srcD + graph.getEdgeData(e);
+
+      // Filter out paths that are already longer than
+      // the destination node's distance.
+      // They won't ever contribute to lowering the destNode's distance.
+      if (destDist != UINT32_MAX && newDist > destDist) continue;
 #ifdef PERF
-      uint32_t d = getPrioData(&prios[dst]);
+      uint32_t oldDist = getPrioData(&prios[dst]);
 #else
-      uint32_t d = prios[dst].load(std::memory_order_relaxed);
+      uint32_t oldDist = prios[dst].load(std::memory_order_relaxed);
 #endif
       // Attempt to CAS the neighbor to a lower distance
-      if (changeMin(prios, dst, d, newDist)) {
+      if (changeMin(prios, dst, oldDist, newDist)) {
         wl.push(newDist, dst);
       }
     }
@@ -256,7 +303,7 @@ void MQThreadTask(Graph& graph, MQ &wl, stat *stats, std::atomic<uint32_t> *prio
 
 template<typename MQ_Type>
 void spawnTasks(MQ_Type& wl, Graph& graph, const GNode& source, int threadNum, std::atomic<uint32_t> *prios) {
-  // init with source
+// init with source
   wl.push(0, source);
 
   stat stats[threadNum];
@@ -270,10 +317,9 @@ void spawnTasks(MQ_Type& wl, Graph& graph, const GNode& source, int threadNum, s
     CPU_SET(coreID, &cpuset);
     std::thread *newThread = new std::thread(
       MQThreadTask<MQ_Type>, std::ref(graph), 
-      std::ref(wl), &stats[i], std::ref(prios)
-    );
+      std::ref(wl), &stats[i], std::ref(prios));
     int rc = pthread_setaffinity_np(newThread->native_handle(),
-                                    sizeof(cpu_set_t), &cpuset);
+                                sizeof(cpu_set_t), &cpuset);
     if (rc != 0) {
         std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
     }
@@ -283,6 +329,7 @@ void spawnTasks(MQ_Type& wl, Graph& graph, const GNode& source, int threadNum, s
   CPU_SET(0, &cpuset);
   sched_setaffinity(0, sizeof(cpuset), &cpuset);
   MQThreadTask<MQ_Type>(graph, wl, &stats[0], prios);
+
   for (std::thread*& worker : workers) {
     worker->join();
     delete worker;
@@ -290,12 +337,12 @@ void spawnTasks(MQ_Type& wl, Graph& graph, const GNode& source, int threadNum, s
 
   auto end = std::chrono::high_resolution_clock::now();
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
-  if (!wl.empty()) {
-    std::cout << "not empty\n";
-  }
-
   wl.stat();
   std::cout << "runtime_ms " << ms << "\n";
+
+  if (!wl.empty()) {
+    std::cout << "not empty!\n";
+  }
 
   for (uint64_t i = 0; i < graph.size(); i++) {
     uint64_t s = prios[i].load(std::memory_order_relaxed);
@@ -310,12 +357,13 @@ void spawnTasks(MQ_Type& wl, Graph& graph, const GNode& source, int threadNum, s
     totalIter += stats[i].iter;
     totalEmptyWork += stats[i].emptyWork;
   }
-  galois::runtime::reportStat_Single("BFS-MQBucket", "Iterations", totalIter);
-  galois::runtime::reportStat_Single("BFS-MQBucket", "EmptyWork", totalEmptyWork);
+
+  galois::runtime::reportStat_Single("SSSP-MBQ", "Iterations", totalIter);
+  galois::runtime::reportStat_Single("SSSP-MBQ", "Emptywork", totalEmptyWork);
 }
 
 template<bool usePrefetch=true>
-void MQAlgo(Graph& graph, GNode source, int threadNum, int queueNum) {
+uint32_t MQAlgo(Graph& graph, const GNode& source, int threadNum, int queueNum) {
   std::cout << "threads = " << threadNum << "\n";
   std::cout << "queues = " << queueNum << "\n";
   std::cout << "batchSizePop = " << batch1 << "\n";
@@ -333,8 +381,7 @@ void MQAlgo(Graph& graph, GNode source, int threadNum, int queueNum) {
 
   // Prefetcher lambda for reducing cache misses on load to a 
   // vertex's distance
-  auto prefetcher = [&] (uint32_t v) -> void {
-    // priority of this node
+  std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
     __builtin_prefetch(&prios[v], 0, 3);
 
     // the first and last of edges
@@ -353,19 +400,63 @@ void MQAlgo(Graph& graph, GNode source, int threadNum, int queueNum) {
     std::cout << "delta = " << stepShift << "\n";
 
     // Lambda for mapping a priority to a priority level
-    auto getBucketID = [&] (uint32_t v) -> mbq::BucketID {
+    std::function<mbq::BucketID(uint32_t)> getBucketID = [&] (uint32_t v) -> mbq::BucketID {
       uint32_t d = prios[v].load(std::memory_order_acquire);
-      return (d >> stepShift);
+      return ((mbq::BucketID)d >> stepShift);
     };
 
-    using MQ_Bucket_Type = mbq::MultiBucketQueue<decltype(getBucketID), decltype(prefetcher), std::greater<mbq::BucketID>, uint32_t, uint32_t, usePrefetch>;
+    using MQ_Bucket_Type = mbq::MultiBucketQueue<decltype(getBucketID), decltype(prefetcher), std::greater<uint32_t>, uint32_t, uint32_t, usePrefetch>;
     MQ_Bucket_Type wl(getBucketID, prefetcher, queueNum, threadNum, stepShift, bucketNum, batch1, batch2, mbq::increasing, stickiness);
     spawnTasks<MQ_Bucket_Type>(wl, graph, source, threadNum, prios);
   }
+
+  
+  return prios[destNode].load(std::memory_order_relaxed);
 }
 
-template <bool CONCURRENT>
-void runAlgo(Graph& graph, const GNode& source) {
+int main(int argc, char** argv) {
+  galois::SharedMemSys G;
+  LonestarStart(argc, argv, name, desc, url, &inputFile);
+
+  galois::StatTimer totalTime("TimerTotal");
+  totalTime.start();
+
+  Graph graph;
+  GNode source;
+
+  std::cout << "Reading from file: " << inputFile << "\n";
+  galois::graphs::readGraph(graph, inputFile);
+  std::cout << "Read " << graph.size() << " nodes, " << graph.sizeEdges()
+            << " edges\n";
+
+  if (startNode >= graph.size() || reportNode >= graph.size()) {
+    std::cerr << "failed to set report: " << reportNode
+              << " or failed to set source: " << startNode << "\n";
+    assert(0);
+    abort();
+  }
+
+  auto it = graph.begin();
+  std::advance(it, startNode.getValue());
+  source = *it;
+  it     = graph.begin();
+
+  size_t approxNodeData = graph.size() * 64;
+  galois::preAlloc(numThreads +
+                   approxNodeData / galois::runtime::pagePoolSize());
+  galois::reportPageAlloc("MeminfoPre");
+
+  galois::do_all(galois::iterate(graph),
+                 [&graph](GNode n) { graph.getData(n) = SSSP::DIST_INFINITY; });
+
+  graph.getData(source) = 0;
+
+  std::cout << "Running " << ALGO_NAMES[algo] << " algorithm\n";
+
+  galois::StatTimer autoAlgoTimer("AutoAlgo_0");
+  galois::StatTimer execTime("Timer_0");
+  execTime.start();
+  uint32_t destDist = SSSP::DIST_INFINITY;
 
   namespace gwl = galois::worklists;
   using PSchunk4 = gwl::PerSocketChunkFIFO<4>;
@@ -390,176 +481,95 @@ void runAlgo(Graph& graph, const GNode& source) {
   using PMOD128 = gwl::AdaptiveOrderedByIntegerMetric<UpdateRequestIndexer, PSchunk128>;
   using PMOD256 = gwl::AdaptiveOrderedByIntegerMetric<UpdateRequestIndexer, PSchunk256>;
 
+
   switch (algo) {
-  case OBIM:
+  case deltaStepOBIM:
     std::cout << "running OBIM with chunk size " << chunk << "\n";
     switch (chunk) {
       case 4:
-        OBIMAlgo<CONCURRENT, UpdateRequest, OBIM4>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, OBIM4>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 8:
-        OBIMAlgo<CONCURRENT, UpdateRequest, OBIM8>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, OBIM8>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 16:
-        OBIMAlgo<CONCURRENT, UpdateRequest, OBIM16>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, OBIM16>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 32:
-        OBIMAlgo<CONCURRENT, UpdateRequest, OBIM32>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, OBIM32>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 64:
-        OBIMAlgo<CONCURRENT, UpdateRequest, OBIM64>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, OBIM64>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 128:
-        OBIMAlgo<CONCURRENT, UpdateRequest, OBIM128>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, OBIM128>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 256:
-        OBIMAlgo<CONCURRENT, UpdateRequest, OBIM256>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, OBIM256>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       default:
         std::cerr << "ERROR: unkown chunk size\n";
     }
     break;
-  case PMOD:
+  case deltaStepPMOD:
     std::cout << "running PMOD with chunk size " << chunk << "\n";
     switch (chunk) {
       case 4:
-        OBIMAlgo<CONCURRENT, UpdateRequest, PMOD4>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, PMOD4>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 8:
-        OBIMAlgo<CONCURRENT, UpdateRequest, PMOD8>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, PMOD8>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 16:
-        OBIMAlgo<CONCURRENT, UpdateRequest, PMOD16>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, PMOD16>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 32:
-        OBIMAlgo<CONCURRENT, UpdateRequest, PMOD32>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, PMOD32>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 64:
-        OBIMAlgo<CONCURRENT, UpdateRequest, PMOD64>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, PMOD64>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 128:
-        OBIMAlgo<CONCURRENT, UpdateRequest, PMOD128>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, PMOD128>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       case 256:
-        OBIMAlgo<CONCURRENT, UpdateRequest, PMOD256>(graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
+        destDist = deltaStepAlgo<UpdateRequest, PMOD256>(
+                    graph, source, ReqPushWrap(), OutEdgeRangeFn{graph});
         break;
       default:
         std::cerr << "ERROR: unkown chunk size\n";
     }
     break;
-  case MQBucket:
-    std::cout << "running MQBucket\n";
-    if (prefetch == 1) MQAlgo<true>(graph, source, threadNum, queueNum); 
-    else MQAlgo<false>(graph, source, threadNum, queueNum); 
-    break;
   case MQ:
     std::cout << "running MQ\n";
-    if (prefetch == 1) MQAlgo<true>(graph, source, threadNum, queueNum); 
-    else MQAlgo<false>(graph, source, threadNum, queueNum); 
+    if (prefetch == 1) destDist = MQAlgo<true>(graph, source, threadNum, queueNum);
+    else  destDist = MQAlgo<false>(graph, source, threadNum, queueNum);
     break;
+  case MQBucket:
+    std::cout << "running MQBucket\n";
+    if (prefetch == 1) destDist = MQAlgo<true>(graph, source, threadNum, queueNum); 
+    else destDist = MQAlgo<false>(graph, source, threadNum, queueNum); 
+    break; 
   default:
-    std::cerr << "ERROR: unkown algo type\n";
-  }
-}
-
-int main(int argc, char** argv) {
-  galois::SharedMemSys G;
-  LonestarStart(argc, argv, name, desc, url, &inputFile);
-
-  galois::StatTimer totalTime("TimerTotal");
-  totalTime.start();
-
-  Graph graph;
-  GNode source;
-  GNode report;
-
-  std::cout << "Reading from file: " << inputFile << "\n";
-  galois::graphs::readGraph(graph, inputFile);
-  std::cout << "Read " << graph.size() << " nodes, " << graph.sizeEdges()
-            << " edges\n";
-
-  if (startNode >= graph.size() || reportNode >= graph.size()) {
-    std::cerr << "failed to set report: " << reportNode
-              << " or failed to set source: " << startNode << "\n";
-    abort();
-  }
-
-  auto it = graph.begin();
-  std::advance(it, startNode.getValue());
-  source = *it;
-  it     = graph.begin();
-  std::advance(it, reportNode.getValue());
-  report = *it;
-
-  size_t approxNodeData = 4 * (graph.size() + graph.sizeEdges());
-  galois::preAlloc(8 * numThreads +
-                   approxNodeData / galois::runtime::pagePoolSize());
-
-  galois::reportPageAlloc("MeminfoPre");
-
-  galois::do_all(galois::iterate(graph),
-                 [&graph](GNode n) { graph.getData(n) = BFS::DIST_INFINITY; });
-  graph.getData(source) = 0;
-
-  std::cout << "Running " << ALGO_NAMES[algo] << " algorithm with "
-            << (bool(execution) ? "PARALLEL" : "SERIAL") << " execution\n";
-
-  galois::StatTimer execTime("Timer_0");
-  execTime.start();
-
-  if (execution == SERIAL) {
-    runAlgo<false>(graph, source);
-  } else if (execution == PARALLEL) {
-    runAlgo<true>(graph, source);
-  } else {
-    std::cerr << "ERROR: unknown type of execution passed to -exec\n";
+    std::abort();
   }
 
   execTime.stop();
-
-  galois::reportPageAlloc("MeminfoPost");
-
-  std::cout << "Node " << reportNode << " has distance "
-            << graph.getData(report) << "\n";
-
-  // Sanity checking code
-  galois::GReduceMax<uint64_t> maxDistance;
-  galois::GAccumulator<uint64_t> distanceSum;
-  galois::GAccumulator<uint32_t> visitedNode;
-  maxDistance.reset();
-  distanceSum.reset();
-  visitedNode.reset();
-
-  galois::do_all(
-      galois::iterate(graph),
-      [&](uint64_t i) {
-        uint32_t myDistance = graph.getData(i);
-
-        if (myDistance != BFS::DIST_INFINITY) {
-          maxDistance.update(myDistance);
-          distanceSum += myDistance;
-          visitedNode += 1;
-        }
-      },
-      galois::loopname("Sanity check"), galois::no_stats());
-
-  // report sanity stats
-  uint64_t rMaxDistance = maxDistance.reduce();
-  uint64_t rDistanceSum = distanceSum.reduce();
-  uint64_t rVisitedNode = visitedNode.reduce();
-  galois::gInfo("# visited nodes is ", rVisitedNode);
-  galois::gInfo("Max distance is ", rMaxDistance);
-  galois::gInfo("Sum of visited distances is ", rDistanceSum);
-
-  if (!skipVerify) {
-    if (BFS::verify(graph, source)) {
-      std::cout << "Verification successful.\n";
-    } else {
-      GALOIS_DIE("verification failed");
-    }
-  }
-
   totalTime.stop();
+  std::cout << "destination node distance = " << destDist << "\n";
 
   return 0;
 }

@@ -400,7 +400,25 @@ public:
     return edgeData[*ni];
   }
 
+  void prefetchEdgeData(edge_iterator ni) {
+    __builtin_prefetch(&edgeData[*ni], 0, 3);
+  }
+
   GraphNode getEdgeDst(edge_iterator ni) { return edgeDst[*ni]; }
+
+  void prefetchEdgeDst(edge_iterator ni) {
+    __builtin_prefetch(&edgeDst[*ni], 0, 3);
+  }
+
+  void prefetchEdgeStart(GraphNode N) {
+    uint32_t edgeStart = (N == 0) ? 0 : (N - 1); 
+    __builtin_prefetch(&edgeIndData[edgeStart], 0, 3);
+  }
+
+  void prefetchEdgeEnd(GraphNode N) {
+    __builtin_prefetch(&edgeIndData[N], 0, 3);
+  }
+
 
   size_t size() const { return numNodes; }
   size_t sizeEdges() const { return numEdges; }

@@ -154,6 +154,9 @@ endif()
 
 find_package(Boost 1.58.0 REQUIRED COMPONENTS serialization iostreams)
 
+# set to a directoy with a build of LLVM that has RTTI enabled
+set(LLVM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../llvm-project/llvm/build")
+
 find_package(LLVM REQUIRED CONFIG)
 if("${LLVM_PACKAGE_VERSION}" VERSION_LESS "7")
   message(FATAL_ERROR "LLVM 7 or greater is required.")

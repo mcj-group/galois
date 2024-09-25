@@ -8,6 +8,7 @@ add_test_scale(small-topo pagerank-pull-cpu -transposedGraph -tolerance=0.01 -al
 
 add_executable(pagerank-push-cpu PageRank-push.cpp)
 add_dependencies(apps pagerank-push-cpu)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../cps)
 target_link_libraries(pagerank-push-cpu PRIVATE Galois::shmem lonestar)
 install(TARGETS pagerank-push-cpu DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT apps EXCLUDE_FROM_ALL)
 
